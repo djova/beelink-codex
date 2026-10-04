@@ -1,11 +1,13 @@
 use super::handlers;
 use super::session::Session;
+use crate::state::ActiveTurn;
 use crate::state::TaskKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::turn_input::SuspendTurnOutcome;
+use codex_protocol::turn_input::SuspendTurnTarget;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -13,8 +15,9 @@ use tracing::warn;
 pub(super) async fn suspend_turn_and_shutdown(
     session: &Arc<Session>,
     submission_id: String,
+    target: SuspendTurnTarget,
 ) -> CodexResult<SuspendTurnOutcome> {
-    {
+    let inspected_turn_id = {
         let active = session.active_turn.lock().await;
         let Some(task) = active.as_ref().and_then(|turn| turn.task.as_ref()) else {
             return Ok(SuspendTurnOutcome::NotActive);
@@ -22,7 +25,13 @@ pub(super) async fn suspend_turn_and_shutdown(
         if task.kind != TaskKind::Regular {
             return Ok(SuspendTurnOutcome::UnsupportedTask);
         }
-    }
+        if let SuspendTurnTarget::Expected { turn_id } = &target
+            && turn_id != &task.turn_context.sub_id
+        {
+            return Ok(SuspendTurnOutcome::Superseded);
+        }
+        task.turn_context.sub_id.clone()
+    };
 
     // This is a snapshot of currently loaded descendants, not a spawn-admission seal.
     // Previously closed descendants and concurrent future spawns remain best effort.
@@ -46,21 +55,14 @@ pub(super) async fn suspend_turn_and_shutdown(
     })?;
 
     // The flush can yield while the active turn completes or changes. Recheck its
-    // kind under the same lock used to remove it.
+    // identity and kind under the same lock used to remove it. Even the legacy
+    // unconditional API must not suspend a different turn after this yield.
     let mut turn = {
         let mut active = session.active_turn.lock().await;
-        let Some(active_turn) = active.as_ref() else {
-            return Ok(SuspendTurnOutcome::NotActive);
-        };
-        let Some(task) = active_turn.task.as_ref() else {
-            return Ok(SuspendTurnOutcome::NotActive);
-        };
-        if task.kind != TaskKind::Regular {
-            return Ok(SuspendTurnOutcome::UnsupportedTask);
+        match take_inspected_turn(&mut active, &inspected_turn_id) {
+            Ok(turn) => turn,
+            Err(outcome) => return Ok(outcome),
         }
-        active.take().ok_or_else(|| {
-            CodexErr::Fatal("accepted root turn suspension had no running turn".to_string())
-        })?
     };
 
     let task = turn.task.take().ok_or_else(|| {
@@ -117,3 +119,24 @@ pub(super) async fn suspend_turn_and_shutdown(
         .await;
     Ok(SuspendTurnOutcome::Suspended { turn_id })
 }
+
+// The caller holds the active-turn lock throughout this comparison and removal.
+fn take_inspected_turn(
+    active: &mut Option<ActiveTurn>,
+    inspected_turn_id: &str,
+) -> Result<ActiveTurn, SuspendTurnOutcome> {
+    let Some(task) = active.as_ref().and_then(|turn| turn.task.as_ref()) else {
+        return Err(SuspendTurnOutcome::NotActive);
+    };
+    if task.kind != TaskKind::Regular {
+        return Err(SuspendTurnOutcome::UnsupportedTask);
+    }
+    if task.turn_context.sub_id != inspected_turn_id {
+        return Err(SuspendTurnOutcome::Superseded);
+    }
+    active.take().ok_or(SuspendTurnOutcome::NotActive)
+}
+
+#[cfg(test)]
+#[path = "turn_suspension_tests.rs"]
+mod tests;

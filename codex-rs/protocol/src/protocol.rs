@@ -61,6 +61,7 @@ use crate::request_permissions::RequestPermissionsResponse;
 use crate::request_user_input::RequestUserInputResponse;
 use crate::turn_input::CyberAccessProgram;
 use crate::turn_input::SuspendTurnOutcome;
+use crate::turn_input::SuspendTurnTarget;
 use crate::turn_input::TurnInputMode;
 use crate::turn_input::TurnInputRequest;
 use crate::turn_input::TurnInputSubmission;
@@ -637,6 +638,7 @@ pub enum Op {
 
     /// Stop the active root turn without recording a terminal turn event.
     SuspendTurnAndShutdown {
+        target: SuspendTurnTarget,
         reply: oneshot::Sender<CodexResult<SuspendTurnOutcome>>,
     },
 

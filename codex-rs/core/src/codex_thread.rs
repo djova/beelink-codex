@@ -471,6 +471,29 @@ impl CodexThread {
     /// Callers must not transfer ownership until suspension succeeds, which
     /// requires stopping execution, flushing history, and closing its writer.
     pub async fn suspend_turn_and_shutdown(&self) -> CodexResult<SuspendTurnOutcome> {
+        self.suspend_target_and_shutdown(codex_protocol::turn_input::SuspendTurnTarget::Current)
+            .await
+    }
+
+    /// Suspend only the inspected root turn, refusing a newer active turn.
+    ///
+    /// The comparison is made in the session actor and repeated under the active
+    /// turn removal lock after persistence yields. This does not seal child spawns,
+    /// guard queued input/settings changes, or prove durable interruption ownership.
+    pub async fn suspend_turn_and_shutdown_if_current(
+        &self,
+        turn_id: String,
+    ) -> CodexResult<SuspendTurnOutcome> {
+        self.suspend_target_and_shutdown(codex_protocol::turn_input::SuspendTurnTarget::Expected {
+            turn_id,
+        })
+        .await
+    }
+
+    async fn suspend_target_and_shutdown(
+        &self,
+        target: codex_protocol::turn_input::SuspendTurnTarget,
+    ) -> CodexResult<SuspendTurnOutcome> {
         if self.session_source.is_non_root_agent() {
             return Err(CodexErr::UnsupportedOperation(
                 "turn suspension requires the owning root thread".to_string(),
@@ -484,7 +507,7 @@ impl CodexThread {
             .tx_sub
             .send(Submission {
                 id: new_submission_id(),
-                op: Op::SuspendTurnAndShutdown { reply },
+                op: Op::SuspendTurnAndShutdown { target, reply },
                 trace: current_span_w3c_trace_context(),
                 parent_turn_id: None,
                 root_turn_id: None,

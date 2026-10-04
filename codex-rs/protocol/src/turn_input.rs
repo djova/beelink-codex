@@ -22,9 +22,21 @@ pub enum SuspendTurnOutcome {
         turn_id: String,
     },
     NotActive,
+    /// The inspected turn is no longer the active turn. No execution is stopped.
+    Superseded,
     /// A currently loaded descendant would remain running after root handoff.
     HasLiveDescendants,
     UnsupportedTask,
+}
+
+/// Which active root turn a suspension operation may stop.
+/// This is an in-process submission type, not an app-server wire contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SuspendTurnTarget {
+    /// Bind to the active turn when the session begins processing this operation.
+    Current,
+    /// Stop only the exact turn inspected by the caller.
+    Expected { turn_id: String },
 }
 
 /// Input consumed by a regular turn.

@@ -15,6 +15,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_once;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -118,7 +119,7 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
 
     assert_eq!(
         codex
-            .suspend_turn_and_shutdown()
+            .suspend_turn_and_shutdown_if_current(turn_id.clone())
             .await
             .expect("reject handoff while a descendant remains loaded"),
         SuspendTurnOutcome::HasLiveDescendants,
@@ -137,7 +138,7 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
     // and removed; suspension only consults the current live subtree.
     assert_eq!(
         codex
-            .suspend_turn_and_shutdown()
+            .suspend_turn_and_shutdown_if_current(turn_id.clone())
             .await
             .expect("stop and close the old writer"),
         SuspendTurnOutcome::Suspended {
@@ -202,6 +203,84 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
         unreachable!("wait_for_event returned unexpected event");
     };
     assert_eq!(completed.turn_id, turn_id);
+}
+
+#[tokio::test]
+async fn root_turn_suspension_rejects_stale_inspection_and_preserves_new_manual_turn() {
+    let server = start_mock_server().await;
+    let responses = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_response_created("old_response"),
+                ev_completed("old_response"),
+            ])),
+            sse_response(sse(vec![
+                ev_response_created("new_response"),
+                ev_completed("new_response"),
+            ]))
+            .set_delay(Duration::from_secs(60)),
+        ],
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await.unwrap();
+    let codex = &test.codex;
+    let codex_core::TurnInputSubmission::Started { turn_id: old_id } = codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "old synthetic action".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap()
+    else {
+        panic!("old turn did not start");
+    };
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let codex_core::TurnInputSubmission::Started { turn_id: new_id } = codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "new manual synthetic action".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap()
+    else {
+        panic!("new manual turn did not start");
+    };
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnStarted(_))).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while responses.requests().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new manual turn must reach the isolated model fixture");
+    let settings = codex.thread_settings_snapshot().await;
+    assert_eq!(
+        codex
+            .suspend_turn_and_shutdown_if_current(old_id)
+            .await
+            .unwrap(),
+        SuspendTurnOutcome::Superseded,
+    );
+    assert_eq!(codex.thread_settings_snapshot().await, settings);
+    // The still-live thread accepts input for the new turn. A stale request did
+    // not close its writer, cancel its execution, or clear its pending input.
+    assert_eq!(
+        codex
+            .steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: "still owned by the manual turn".into(),
+                    text_elements: Vec::new(),
+                }]),
+                new_id.clone(),
+            )
+            .await
+            .unwrap(),
+        codex_core::SteerSubmission::Steered { turn_id: new_id },
+    );
+    codex.submit(Op::Interrupt).await.unwrap();
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
+    assert_eq!(responses.requests().len(), 2);
 }
 
 /// After an interrupt we expect the next request to the model to include both
