@@ -196,12 +196,24 @@ impl Session {
         let mut window = input_checkpoint
             .and_then(|checkpoint| reconstructed_window_from_compaction(checkpoint.compacted));
 
-        // Scan the selected items backward to find the newest surviving turn state.
+        // A standalone settings update invalidates warm recovery even if its values
+        // are unchanged. Preserve that barrier on cold resume. Existing histories do
+        // not distinguish updates from checkpoints, so an owned (or legacy unowned)
+        // snapshot conservatively holds recovery until a newer turn has started.
+        // Some(None) is a barrier, not absence: it must not fall back to a stale
+        // compaction's recorded turn identity.
         let last_started_turn_id = replay_items
             .iter()
             .rev()
             .find_map(|item| match item {
-                RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.turn_id.clone()),
+                RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                    Some(Some(event.turn_id.clone()))
+                }
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                    if event.thread_id.is_none() || event.thread_id == Some(self.thread_id()) =>
+                {
+                    Some(None)
+                }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
@@ -215,7 +227,9 @@ impl Session {
                 | RolloutItem::Compacted(_)
                 | RolloutItem::EventMsg(_) => None,
             })
-            .or_else(|| resume_metadata.and_then(|metadata| metadata.last_started_turn_id.clone()));
+            .unwrap_or_else(|| {
+                resume_metadata.and_then(|metadata| metadata.last_started_turn_id.clone())
+            });
 
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;

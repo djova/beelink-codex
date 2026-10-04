@@ -31,6 +31,128 @@ use std::path::PathBuf;
 use test_case::test_case;
 use uuid::Uuid;
 
+#[derive(Clone, Copy)]
+enum ColdSettingsTail {
+    Owned,
+    ChangedBack,
+    Legacy,
+    Foreign,
+    NewerTurn,
+    AfterCompaction,
+    CheckpointOnly,
+    ClearedCheckpoint,
+}
+
+#[test_case(ColdSettingsTail::Owned; "owned settings snapshot")]
+#[test_case(ColdSettingsTail::ChangedBack; "settings changed and restored")]
+#[test_case(ColdSettingsTail::Legacy; "legacy ownership unknown")]
+#[test_case(ColdSettingsTail::Foreign; "foreign copied settings")]
+#[test_case(ColdSettingsTail::NewerTurn; "new manual turn wins")]
+#[test_case(ColdSettingsTail::AfterCompaction; "stale checkpoint cannot bypass barrier")]
+#[test_case(ColdSettingsTail::CheckpointOnly; "unchanged checkpoint metadata")]
+#[test_case(ColdSettingsTail::ClearedCheckpoint; "compacted invalidation retained")]
+#[tokio::test]
+async fn recovery_rejects_cold_settings_barrier(tail: ColdSettingsTail) {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let started = |id: &str| {
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            serde_json::from_value(json!({
+                "turn_id": id, "model_context_window": null
+            }))
+            .unwrap(),
+        ))
+    };
+    let settings = super::thread_settings::applied_event(&session).await;
+    let mut saved = vec![started("old-turn")];
+    let mut expected = None;
+    match tail {
+        ColdSettingsTail::Owned => saved.push(RolloutItem::EventMsg(settings)),
+        ColdSettingsTail::ChangedBack => {
+            let mut changed = settings.clone();
+            if let EventMsg::ThreadSettingsApplied(event) = &mut changed {
+                event.thread_settings.model = "synthetic-changed-model".into();
+            }
+            saved.extend([
+                RolloutItem::EventMsg(changed),
+                RolloutItem::EventMsg(settings),
+            ]);
+        }
+        ColdSettingsTail::Legacy | ColdSettingsTail::Foreign => {
+            let mut copied = settings;
+            if let EventMsg::ThreadSettingsApplied(event) = &mut copied {
+                event.thread_id = match tail {
+                    ColdSettingsTail::Legacy => None,
+                    _ => Some(ThreadId::new()),
+                };
+            }
+            saved.push(RolloutItem::EventMsg(copied));
+            if matches!(tail, ColdSettingsTail::Foreign) {
+                expected = Some("old-turn".to_owned());
+            }
+        }
+        ColdSettingsTail::NewerTurn => {
+            saved.extend([RolloutItem::EventMsg(settings), started("manual-turn")]);
+            expected = Some("manual-turn".to_owned());
+        }
+        ColdSettingsTail::AfterCompaction
+        | ColdSettingsTail::CheckpointOnly
+        | ColdSettingsTail::ClearedCheckpoint => {
+            let mut checkpoint: CompactedItem = serde_json::from_value(json!({
+                "message": "synthetic checkpoint", "replacement_history": [], "window_number": 1
+            }))
+            .unwrap();
+            checkpoint.resume_metadata = Some(codex_history::CompactionResumeMetadata {
+                multi_agent_version: None,
+                last_started_turn_id: (!matches!(tail, ColdSettingsTail::ClearedCheckpoint))
+                    .then(|| "old-turn".to_owned()),
+                previous_turn_settings: None,
+            });
+            saved.push(RolloutItem::Compacted(checkpoint));
+            if matches!(tail, ColdSettingsTail::AfterCompaction) {
+                saved.push(RolloutItem::EventMsg(settings));
+            } else if matches!(tail, ColdSettingsTail::CheckpointOnly) {
+                expected = Some("old-turn".to_owned());
+            }
+        }
+    }
+    // Serialize only a committed history prefix and hydrate a fresh runtime: no
+    // warm invalidation state survives this synthetic process-loss boundary.
+    let saved =
+        serde_json::from_slice::<Vec<RolloutItem>>(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    let rebuilt = session
+        .reconstruct_history_from_rollout(&turn_context, &saved)
+        .await;
+    assert_eq!(rebuilt.last_started_turn_id, expected);
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.thread_id,
+            history: Arc::new(saved),
+            rollout_path: None,
+        }))
+        .await;
+    assert_eq!(session.state.lock().await.last_started_turn_id, expected);
+    if expected.as_deref() != Some("old-turn") {
+        let before = session.thread_settings_snapshot().await;
+        let result = super::turn_input::handle_recovery(
+            &session,
+            codex_protocol::protocol::ThreadSettingsOverrides::default(),
+            crate::TurnStartOptions::default(),
+            "old-turn".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            codex_protocol::turn_input::TurnInputSubmission::NotSubmitted {
+                reason: codex_protocol::turn_input::NotSubmittedReason::Superseded,
+            }
+        );
+        assert_eq!(session.thread_settings_snapshot().await, before);
+        assert!(session.active_turn.lock().await.is_none());
+    }
+}
+
 #[tokio::test]
 async fn recorded_questions_share_queued_input_order_across_resume() {
     let (session, turn) = make_session_and_context().await;
