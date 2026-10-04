@@ -522,6 +522,22 @@ pub(super) async fn submission_loop(
                     let _ = reply.send(result);
                     should_exit
                 }
+                Op::RestoreThreadSettings {
+                    thread_settings,
+                    reply,
+                } => {
+                    let _settings_guard = thread_settings::acquire_persistence_lock(&sess).await;
+                    let result = thread_settings::update(&sess, thread_settings)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| {
+                            CodexErr::InvalidRequest(format!(
+                                "invalid restored thread settings: {error}"
+                            ))
+                        });
+                    let _ = reply.send(result);
+                    false
+                }
                 Op::ThreadSettings {
                     thread_settings,
                     reply,

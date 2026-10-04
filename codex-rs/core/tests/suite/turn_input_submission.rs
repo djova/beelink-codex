@@ -619,6 +619,45 @@ async fn recover_turn_if_idle_yields_to_new_manual_turn_and_settings_change() {
     );
 }
 
+#[tokio::test]
+async fn standalone_settings_restoration_invalidates_recovery_even_when_values_match() {
+    let server = responses::start_mock_server().await;
+    let test = test_codex().build_with_auto_env(&server).await.unwrap();
+    let response = responses::mount_sse_once(&server, responses::sse_completed("done")).await;
+    let TurnInputSubmission::Started { turn_id } = test
+        .codex
+        .start_or_steer_turn(user_message_request("synthetic original action"))
+        .await
+        .unwrap()
+    else {
+        panic!("original turn did not start");
+    };
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let before = test.codex.thread_settings_snapshot().await;
+    let saved = test.codex.restorable_thread_settings().await;
+    test.codex.restore_thread_settings(saved).await.unwrap();
+    assert_eq!(test.codex.thread_settings_snapshot().await, before);
+    assert_eq!(
+        test.codex
+            .recover_turn_if_idle(RecoverTurnRequest {
+                turn_id,
+                thread_settings: Default::default(),
+                trace: None,
+                cyber_access_program: None,
+            })
+            .await
+            .unwrap(),
+        StartIfIdleSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded,
+        },
+    );
+    assert_eq!(test.codex.thread_settings_snapshot().await, before);
+    assert_eq!(response.requests().len(), 1);
+}
+
 /// Internal continuation creates a new turn without adding user authorization.
 #[tokio::test]
 async fn continue_turn_if_idle_starts_new_turn_with_internal_input() {

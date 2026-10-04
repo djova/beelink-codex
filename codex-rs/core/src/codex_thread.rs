@@ -161,6 +161,47 @@ pub struct CodexThreadSettingsOverrides {
     pub disabled_plugin_ids: Option<Vec<String>>,
 }
 
+impl From<CodexThreadSettingsOverrides> for ThreadSettingsOverrides {
+    fn from(settings: CodexThreadSettingsOverrides) -> Self {
+        let CodexThreadSettingsOverrides {
+            environments,
+            runtime_workspace_roots,
+            profile_workspace_roots,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            permission_profile,
+            active_permission_profile,
+            windows_sandbox_level,
+            model,
+            effort,
+            summary,
+            service_tier,
+            collaboration_mode,
+            personality,
+            disabled_plugin_ids,
+        } = settings;
+        Self {
+            environments,
+            runtime_workspace_roots,
+            profile_workspace_roots,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            permission_profile,
+            active_permission_profile,
+            windows_sandbox_level,
+            model,
+            effort,
+            summary,
+            service_tier,
+            collaboration_mode,
+            personality,
+            disabled_plugin_ids,
+        }
+    }
+}
+
 pub use codex_guardian_context::GuardianRootMessage;
 
 /// Authorization state that changes on genuine user input or history resets.
@@ -660,12 +701,20 @@ impl CodexThread {
     ///
     /// Runtime replacement uses this after resume so clients keep their current thread settings
     /// rather than reverting to the original layer-backed config.
+    /// Serialized with submitted operations; standalone restoration supersedes
+    /// automatic recovery in this runtime. Recovery that restores its own saved
+    /// settings must supply them in the conditional recovery request instead.
     pub async fn restore_thread_settings(
         &self,
         settings: CodexThreadSettingsOverrides,
-    ) -> ConstraintResult<()> {
-        let updates = Self::thread_settings_update(settings);
-        self.session.update_settings(updates).await.map(|_| ())
+    ) -> CodexResult<()> {
+        let (reply, result) = oneshot::channel();
+        self.submit(Op::RestoreThreadSettings {
+            thread_settings: settings.into(),
+            reply,
+        })
+        .await?;
+        result.await.unwrap_or(Err(CodexErr::InternalAgentDied))
     }
 
     /// Persists current settings without emitting a live settings event.
@@ -676,7 +725,7 @@ impl CodexThread {
     }
 
     fn thread_settings_update(overrides: CodexThreadSettingsOverrides) -> SessionSettingsUpdate {
-        let CodexThreadSettingsOverrides {
+        let ThreadSettingsOverrides {
             environments,
             runtime_workspace_roots,
             profile_workspace_roots,
@@ -693,7 +742,7 @@ impl CodexThread {
             collaboration_mode,
             personality,
             disabled_plugin_ids,
-        } = overrides;
+        } = overrides.into();
         SessionSettingsUpdate {
             step_settings: StepSettingsUpdate {
                 model,

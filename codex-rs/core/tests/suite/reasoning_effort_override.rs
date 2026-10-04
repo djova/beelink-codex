@@ -300,16 +300,12 @@ async fn reasoning_effort_override_recovery_reuses_trusted_tail_update() -> anyh
     let resumed = resume_builder
         .resume(&recovery_server, Arc::clone(&test.home), rollout_path)
         .await?;
-    resumed
-        .codex
-        .restore_thread_settings(thread_settings)
-        .await?;
     assert_eq!(
         resumed
             .codex
             .recover_turn_if_idle(RecoverTurnRequest {
                 turn_id: turn_id.clone(),
-                thread_settings: Default::default(),
+                thread_settings: thread_settings.into(),
                 trace: None,
                 cyber_access_program: None,
             })

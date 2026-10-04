@@ -642,6 +642,12 @@ pub enum Op {
         reply: oneshot::Sender<CodexResult<SuspendTurnOutcome>>,
     },
 
+    /// Restore thread settings through the actor without emitting a settings event.
+    RestoreThreadSettings {
+        thread_settings: ThreadSettingsOverrides,
+        reply: oneshot::Sender<CodexResult<()>>,
+    },
+
     /// Apply thread-settings overrides without starting a turn.
     ///
     /// This uses the same submission queue as turn starts so app-server can
@@ -946,6 +952,7 @@ impl Op {
             Self::TurnInput { .. } => "turn_input",
             Self::RecoverTurn { .. } => "recover_turn",
             Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
+            Self::RestoreThreadSettings { .. } => "restore_thread_settings",
             Self::ThreadSettings { .. } => "thread_settings",
             Self::TurnSettings { .. } => "turn_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
