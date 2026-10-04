@@ -247,6 +247,48 @@ async fn start_only_rejects_active_turn_without_injecting() {
 }
 
 #[tokio::test]
+async fn recovery_rejects_superseded_turn_before_applying_settings_or_reserving_idle() {
+    // These are the actor state after a newer manual turn finishes, after a
+    // standalone settings change, and before any turn was ever recorded.
+    for latest in [Some("newer-manual-turn"), None] {
+        let (session, _, _rx) = make_session_and_context_with_rx().await;
+        session.state.lock().await.last_started_turn_id = latest.map(str::to_owned);
+        let original_settings = session.get_config().await;
+        let submission = handle_recovery(
+            &session,
+            ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                ..Default::default()
+            },
+            TurnStartOptions::default(),
+            "stale-recovery-turn".to_string(),
+        )
+        .await
+        .expect("stale recovery returns a typed rejection");
+        assert_eq!(
+            submission,
+            TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::Superseded,
+            }
+        );
+        assert!(session.active_turn.lock().await.is_none());
+        assert_eq!(
+            session
+                .get_config()
+                .await
+                .permissions
+                .approval_policy
+                .value(),
+            original_settings.permissions.approval_policy.value()
+        );
+        assert_eq!(
+            session.state.lock().await.last_started_turn_id.as_deref(),
+            latest
+        );
+    }
+}
+
+#[tokio::test]
 async fn recovery_rejects_active_turn_without_injecting_or_applying_settings() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let original_approval_policy = session

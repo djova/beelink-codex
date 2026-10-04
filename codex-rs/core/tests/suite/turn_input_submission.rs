@@ -454,13 +454,38 @@ async fn start_turn_if_idle_keeps_automatic_plan_rejections_atomic(
 #[tokio::test]
 async fn recover_turn_if_idle_preserves_id_and_resumes_plan_mode() {
     let server = responses::start_mock_server().await;
-    let response_mock =
-        responses::mount_sse_once(&server, responses::sse_completed("resp-1")).await;
+    let original = responses::mount_response_once(
+        &server,
+        responses::sse_response(responses::sse_completed("original"))
+            .set_delay(Duration::from_secs(60)),
+    )
+    .await;
     let test = test_codex()
         .build_with_auto_env(&server)
         .await
         .expect("build recovered turn session");
-    let turn_id = "durable-recovered-turn";
+    let TurnInputSubmission::Started { turn_id } = test
+        .codex
+        .start_or_steer_turn(user_message_request("recover only this recorded turn"))
+        .await
+        .expect("start original turn")
+    else {
+        panic!("original turn did not start");
+    };
+    timeout(Duration::from_secs(10), async {
+        while original.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("original input reaches isolated mock");
+    test.codex.submit(Op::Interrupt).await.unwrap();
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    let response_mock =
+        responses::mount_sse_once(&server, responses::sse_completed("resp-1")).await;
 
     let submission = test
         .codex
@@ -516,9 +541,82 @@ async fn recover_turn_if_idle_preserves_id_and_resumes_plan_mode() {
     .expect("recovered turn metadata should be valid JSON");
     assert_eq!(turn_metadata["turn_trigger"].as_str(), Some("retry"));
     let user_input_groups = request.message_input_text_groups("user");
-    assert_eq!(user_input_groups.len(), 1);
-    assert_eq!(user_input_groups[0].len(), 1);
-    assert!(user_input_groups[0][0].starts_with("<environment_context>"));
+    assert_eq!(
+        user_input_groups
+            .iter()
+            .flatten()
+            .filter(|text| text.contains("recover only this recorded turn"))
+            .count(),
+        1,
+        "recovery must not replay original user input"
+    );
+}
+
+#[tokio::test]
+async fn recover_turn_if_idle_yields_to_new_manual_turn_and_settings_change() {
+    let server = responses::start_mock_server().await;
+    let test = test_codex().build_with_auto_env(&server).await.unwrap();
+    let mut ids = Vec::new();
+    for text in ["first user action", "newer manual action"] {
+        responses::mount_sse_once(&server, responses::sse_completed(text)).await;
+        let TurnInputSubmission::Started { turn_id } = test
+            .codex
+            .start_or_steer_turn(user_message_request(text))
+            .await
+            .unwrap()
+        else {
+            panic!("manual turn did not start");
+        };
+        ids.push(turn_id);
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
+    let before = test.codex.thread_settings_snapshot().await;
+    let recovery = |turn_id: String| RecoverTurnRequest {
+        turn_id,
+        thread_settings: ThreadSettingsOverrides {
+            approval_policy: Some(AskForApproval::Never),
+            ..Default::default()
+        },
+        trace: None,
+        cyber_access_program: None,
+    };
+    assert_eq!(
+        test.codex
+            .recover_turn_if_idle(recovery(ids[0].clone()))
+            .await
+            .unwrap(),
+        StartIfIdleSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded
+        }
+    );
+    assert_eq!(test.codex.thread_settings_snapshot().await, before);
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            effort: Some(Some(codex_protocol::openai_models::ReasoningEffort::High)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let changed = test.codex.thread_settings_snapshot().await;
+    assert_eq!(
+        test.codex
+            .recover_turn_if_idle(recovery(ids[1].clone()))
+            .await
+            .unwrap(),
+        StartIfIdleSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded
+        }
+    );
+    assert_eq!(test.codex.thread_settings_snapshot().await, changed);
+    assert_eq!(
+        responses::received_responses_requests(&server).await.len(),
+        2
+    );
 }
 
 /// Internal continuation creates a new turn without adding user authorization.

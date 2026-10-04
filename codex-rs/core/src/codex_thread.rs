@@ -416,6 +416,9 @@ impl CodexThread {
     ///
     /// Recovery starts no new user input and preserves the turn ID that was
     /// already recorded for the interrupted turn.
+    /// Rejects an ID superseded by a newer task or a standalone settings change
+    /// in this runtime. Settings-only invalidation is not yet durable on cold resume.
+    /// This does not itself prove interruption ownership or reconcile tool outcomes.
     pub async fn recover_turn_if_idle(
         &self,
         request: RecoverTurnRequest,

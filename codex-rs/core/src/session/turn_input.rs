@@ -266,9 +266,12 @@ pub(super) async fn handle_recovery(
     start_if_idle(
         session,
         request,
-        submission_id,
+        submission_id.clone(),
         TurnStartKind::Recovery,
-        /*expected_previous_turn_id*/ None,
+        // Recovery owns an already recorded turn, never an arbitrary or older ID.
+        // Check in the same idle reservation as continuation admission so a newer
+        // manual turn (even completed) or standalone settings change wins.
+        Some(submission_id),
     )
     .await
 }
