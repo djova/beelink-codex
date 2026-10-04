@@ -638,9 +638,9 @@ async fn standalone_settings_restoration_invalidates_recovery_even_when_values_m
     .await;
     let before = test.codex.thread_settings_snapshot().await;
     let mut saved = test.codex.restorable_thread_settings().await;
-    // The restoration helper resolves an unset tier to its backend default.
-    // Keep the exact public value here to test a genuinely unchanged snapshot.
-    saved.service_tier = Some(before.service_tier.clone());
+    // An explicit tier reset normalizes to the backend default. Omit this edit
+    // to preserve the existing value and test a genuinely unchanged snapshot.
+    saved.service_tier = None;
     test.codex.restore_thread_settings(saved).await.unwrap();
     assert_eq!(test.codex.thread_settings_snapshot().await, before);
     assert_eq!(
