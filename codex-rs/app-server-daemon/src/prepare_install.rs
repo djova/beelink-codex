@@ -296,11 +296,7 @@ async fn prepare_from_package(
                 "daemon selection changed while preparing its package; retry the command"
             );
             if let Some(backend) = &backend {
-                if let Err(error) = crate::thread_recovery::discard_pending(daemon) {
-                    eprintln!(
-                        "warning: failed to clear stale daemon recovery before replacement: {error}"
-                    );
-                }
+                crate::thread_recovery::require_clear(daemon)?;
                 backend
                     .stop_with_grace(settings.shutdown_grace_seconds)
                     .await?;

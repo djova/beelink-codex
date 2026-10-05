@@ -393,9 +393,6 @@ impl Daemon {
             LifecycleCommand::Restart => selected.restart().await,
             LifecycleCommand::Stop => {
                 let output = selected.stop().await?;
-                if let Err(err) = thread_recovery::discard_pending(&selected) {
-                    eprintln!("warning: failed to clear saved threads after daemon stop: {err}");
-                }
                 Ok(output)
             }
             LifecycleCommand::Version => unreachable!(),
@@ -421,12 +418,7 @@ impl Daemon {
                 self.wait_until_ready().await?,
             )
         } else {
-            // A fresh start must ignore snapshots left by older stop clients.
-            if let Err(err) = thread_recovery::discard_pending(self) {
-                self.diagnostic(format_args!(
-                    "warning: failed to clear stale daemon recovery before start: {err}"
-                ));
-            }
+            thread_recovery::require_clear(self)?;
             prepare_install::prepare(self, &settings).await?;
             managed.managed_codex_bin = self.current_managed_codex_bin()?;
             managed.ensure_managed_codex_bin()?;
@@ -475,9 +467,7 @@ impl Daemon {
 
         managed.ensure_managed_codex_bin()?;
         if let Some(backend) = self.running_backend_instance(&settings).await? {
-            if let Err(err) = thread_recovery::discard_pending(self) {
-                eprintln!("warning: failed to clear stale daemon recovery before restart: {err}");
-            }
+            thread_recovery::require_clear(self)?;
             backend
                 .stop_with_grace(settings.shutdown_grace_seconds)
                 .await?;
@@ -553,11 +543,7 @@ impl Daemon {
                 RestartDecision::Restart => {
                     #[cfg(windows)]
                     backend::windows::ensure_detached_launch(managed_codex_bin)?;
-                    if let Err(err) = thread_recovery::discard_pending(self) {
-                        eprintln!(
-                            "warning: failed to clear stale daemon recovery before update: {err}"
-                        );
-                    }
+                    thread_recovery::require_clear(self)?;
                     backend
                         .stop_with_grace(settings.shutdown_grace_seconds)
                         .await?;
@@ -759,11 +745,7 @@ impl Daemon {
         settings.save(&self.settings_file).await?;
 
         let app_server_version = if let Some(backend) = backend {
-            if let Err(err) = thread_recovery::discard_pending(self) {
-                eprintln!(
-                    "warning: failed to clear stale recovery before remote-control restart: {err}"
-                );
-            }
+            thread_recovery::require_clear(self)?;
             backend
                 .stop_with_grace(settings.shutdown_grace_seconds)
                 .await?;
@@ -807,9 +789,7 @@ impl Daemon {
             .stop()
             .await?;
         if let Some(backend) = self.running_backend_instance(&settings).await? {
-            if let Err(err) = thread_recovery::discard_pending(self) {
-                eprintln!("warning: failed to clear stale daemon recovery before bootstrap: {err}");
-            }
+            thread_recovery::require_clear(self)?;
             backend
                 .stop_with_grace(settings.shutdown_grace_seconds)
                 .await?;
@@ -1321,7 +1301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_and_fresh_start_discard_pending_thread_restore() {
+    async fn restart_interlock_stop_and_fresh_start_preserve_pending_thread_restore() {
         let home = TempDir::new().expect("home");
         let state = home.path().join("app-server-daemon");
         codex_uds::prepare_private_socket_directory(&state)
@@ -1349,7 +1329,7 @@ mod tests {
                 .status,
             LifecycleStatus::NotRunning
         );
-        assert!(!daemon.recovery_file().expect("recovery path").exists());
+        assert!(daemon.recovery_file().expect("recovery path").exists());
         // Simulate an older stop client leaving a snapshot behind.
         std::fs::write(
             daemon.recovery_file().expect("recovery path"),
@@ -1359,8 +1339,42 @@ mod tests {
         daemon
             .run(super::LifecycleCommand::Start)
             .await
-            .expect_err("missing backend binary");
-        assert!(!daemon.recovery_file().expect("recovery path").exists());
+            .expect_err("retained recovery holds launch before backend preparation");
+        assert_eq!(
+            std::fs::read(daemon.recovery_file().expect("recovery path")).unwrap(),
+            br#"["thread"]"#,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_interlock_old_package_cannot_launch_or_consume_handoff() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let state = home.path().join("app-server-daemon");
+        std::fs::create_dir(&state).unwrap();
+        let binary = home.path().join("old-codex");
+        std::fs::write(&binary, "#!/bin/sh\n: > \"$0.started\"\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let daemon = Daemon {
+            log_diagnostics: false,
+            socket_path: home.path().join("server.sock"),
+            pid_file: state.join("server.pid"),
+            update_pid_file: state.join("updater.pid"),
+            operation_lock_file: state.join("daemon.lock"),
+            settings_file: state.join("settings.json"),
+            managed_codex_bin: binary.clone(),
+        };
+        let path = daemon.recovery_file().unwrap();
+        for retained in [b"[\"legacy-thread\"]".as_slice(), b"{", b""] {
+            std::fs::write(&path, retained).unwrap();
+            let backend =
+                crate::backend::pid_backend(daemon.backend_paths(&DaemonSettings::default()));
+            assert!(backend.start().await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), retained);
+            assert!(!daemon.pid_file.exists());
+            assert!(!binary.with_file_name("old-codex.started").exists());
+        }
     }
 
     #[cfg(unix)]

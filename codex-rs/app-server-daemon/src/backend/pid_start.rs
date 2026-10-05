@@ -25,6 +25,16 @@ impl PidBackend {
                 .with_context(|| format!("failed to create pid directory {}", parent.display()))?;
         }
         let reservation_lock = self.acquire_reservation_lock().await?;
+        if matches!(self.command_kind, super::PidCommandKind::AppServer { .. }) {
+            let home = self
+                .pid_file
+                .parent()
+                .and_then(std::path::Path::parent)
+                .context("daemon pid path has no Codex home")?;
+            codex_app_server_transport::recovery_interlock::require_no_pending(
+                &codex_app_server_transport::daemon_recovery_file_path(home),
+            )?;
+        }
         loop {
             match fs::OpenOptions::new()
                 .create_new(true)
@@ -95,15 +105,16 @@ impl PidBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log.into_std().await));
-        // Older or pinned managed binaries may predate this optional startup flag.
+        // Rollback is refused unless the pinned package implements the common
+        // startup interlock. Never fall back to launching an incompatible server.
         let managed_app_server =
             matches!(self.command_kind, super::PidCommandKind::AppServer { .. });
-        if managed_app_server
-            && matches!(
+        if managed_app_server {
+            let compatible = matches!(
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     Command::new(&codex_bin)
-                        .args(["app-server", "--managed-daemon", "--help"])
+                        .args(["app-server", "--managed-daemon", "--require-recovery-interlock-v1", "--help"])
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
@@ -111,23 +122,23 @@ impl PidBackend {
                         .status(),
                 ).await,
                 Ok(Ok(status)) if status.success()
-            )
-        {
-            command.arg("--managed-daemon");
-        } else if managed_app_server {
-            let codex_home = self
+            );
+            let home = self
                 .pid_file
                 .parent()
                 .and_then(std::path::Path::parent)
                 .context("daemon pid path has no Codex home")?;
-            let recovery_file = codex_app_server_transport::daemon_recovery_file_path(codex_home);
-            match fs::remove_file(&recovery_file).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    tracing::warn!(path = %recovery_file.display(), %err, "failed to clear daemon recovery state before legacy launch");
+            let clear = codex_app_server_transport::recovery_interlock::require_no_pending(
+                &codex_app_server_transport::daemon_recovery_file_path(home),
+            );
+            if !compatible || clear.is_err() {
+                if replacement.is_none() {
+                    let _ = fs::remove_file(&self.pid_file).await;
                 }
+                clear?;
+                bail!("selected package lacks required recovery interlock v1; rollback held");
             }
+            command.args(["--managed-daemon", "--require-recovery-interlock-v1"]);
         }
         if let Some((key, value)) = self.command_env() {
             command.env(key, value);

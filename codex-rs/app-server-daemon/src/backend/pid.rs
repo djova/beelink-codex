@@ -227,6 +227,11 @@ impl PidBackend {
                     break;
                 }
                 if !forced && started_at.elapsed() >= force_after {
+                    if matches!(self.command_kind, PidCommandKind::AppServer { .. }) {
+                        bail!(
+                            "managed stop held for {pid}: automatic force termination cannot prove durable interruption ownership"
+                        );
+                    }
                     #[cfg(unix)]
                     self.force_terminate_process(pid)?;
                     #[cfg(windows)]

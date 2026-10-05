@@ -20,6 +20,52 @@ use super::read_stderr_log_tail;
 use super::stderr_log_file_for_pid_file;
 use super::try_lock_file;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_interlock_handoff_created_while_launcher_waits_is_preserved() {
+    let home = TempDir::new().unwrap();
+    let state = home.path().join("app-server-daemon");
+    std::fs::create_dir(&state).unwrap();
+    let backend = PidBackend::new(
+        home.path().join("never-run"),
+        state.join("server.pid"),
+        false,
+    );
+    let held = backend.acquire_reservation_lock().await.unwrap();
+    let path = codex_app_server_transport::daemon_recovery_file_path(home.path());
+    let launch = backend.start_inner(None);
+    tokio::pin!(launch);
+    // Poll the actual launch into its PID-lock wait, then introduce retained work.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut launch)
+            .await
+            .is_err()
+    );
+    std::fs::write(&path, b"{unknown").unwrap();
+    drop(held);
+    assert!(launch.await.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"{unknown");
+    assert!(!backend.pid_file.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_interlock_incompatible_package_is_refused_even_without_handoff() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TempDir::new().unwrap();
+    let state = home.path().join("app-server-daemon");
+    let binary = home.path().join("old-codex");
+    std::fs::write(&binary,
+        "#!/bin/sh\nfor arg do\n[ \"$arg\" = --require-recovery-interlock-v1 ] && exit 2\ndone\n: > \"$0.started\"\nexit 0\n",
+    ).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = PidBackend::new(binary.clone(), state.join("server.pid"), false);
+    let error = backend.start_inner(None).await.unwrap_err();
+    assert!(error.to_string().contains("rollback held"));
+    assert!(!binary.with_file_name("old-codex.started").exists());
+    assert!(!backend.pid_file.exists());
+}
+
 #[cfg(windows)]
 fn is_elevated_test_process() -> anyhow::Result<bool> {
     let output = std::process::Command::new("powershell.exe")
@@ -122,7 +168,7 @@ async fn stop_waits_for_live_reservation_to_resolve() {
 }
 
 #[tokio::test]
-async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
+async fn restart_interlock_stale_pid_is_cleaned_before_incompatible_package_hold() {
     let temp_dir = TempDir::new().expect("temp dir");
     let state_dir = temp_dir.path().join("state");
     codex_uds::prepare_private_socket_directory(&state_dir)
@@ -149,15 +195,12 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
         assert!(!backend.lock_file.exists());
         return;
     }
-    assert!(
-        err.to_string()
-            .starts_with("failed to spawn detached app-server process using ")
-    );
+    assert!(err.to_string().contains("rollback held"));
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn legacy_launch_clears_recovery_best_effort() {
+async fn restart_interlock_legacy_launch_preserves_invalid_or_retained_work() {
     for snapshot_is_directory in [false, true] {
         let home = TempDir::new().expect("temp dir");
         let state_dir = home.path().join("app-server-daemon");
@@ -178,10 +221,13 @@ async fn legacy_launch_clears_recovery_best_effort() {
         assert!(
             error
                 .to_string()
-                .starts_with("failed to spawn detached app-server process using "),
+                .contains("retained recovery work requires reconciliation"),
             "{error:#}"
         );
-        assert_eq!(recovery_file.exists(), snapshot_is_directory);
+        assert!(recovery_file.exists());
+        if !snapshot_is_directory {
+            assert_eq!(std::fs::read(&recovery_file).unwrap(), b"{}");
+        }
     }
 }
 
@@ -224,17 +270,17 @@ async fn stale_record_cleanup_preserves_replacement_record() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pid_record_captures_the_resolved_launch_binary() {
+async fn restart_interlock_pid_record_captures_the_resolved_compatible_package() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = TempDir::new().expect("temp dir");
     let original = temp.path().join("original-codex");
     let replacement = temp.path().join("replacement-codex");
     for (path, bytes) in [
-        (&original, b"#!/bin/sh\nexec sleep 30\n".as_slice()),
+        (&original, b"#!/bin/sh\nfor arg do [ \"$arg\" = --help ] && exit 0; done\nexec sleep 30\n".as_slice()),
         (
             &replacement,
-            b"#!/bin/sh\n# replacement\nexec sleep 30\n".as_slice(),
+            b"#!/bin/sh\n# replacement\nfor arg do [ \"$arg\" = --help ] && exit 0; done\nexec sleep 30\n".as_slice(),
         ),
     ] {
         std::fs::write(path, bytes).expect("binary");
@@ -354,7 +400,7 @@ async fn stop_reaps_untracked_app_server_child() {
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn shutdown_grace_child() {
+async fn restart_interlock_shutdown_grace_child() {
     let Some(ready) = std::env::var_os("CODEX_TEST_SHUTDOWN_GRACE_READY") else {
         return;
     };
@@ -387,7 +433,7 @@ async fn shutdown_grace_child() {
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn shutdown_grace_handles_process_exit() {
+async fn restart_interlock_shutdown_grace_exits_or_holds_without_force() {
     let temp = TempDir::new().expect("temp dir");
     for (name, grace_seconds, exits) in [
         ("zero", 0, false),
@@ -396,7 +442,10 @@ async fn shutdown_grace_handles_process_exit() {
     ] {
         let ready = temp.path().join(format!("{name}.ready"));
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", "backend::pid::tests::shutdown_grace_child"])
+            .args([
+                "--exact",
+                "backend::pid::tests::restart_interlock_shutdown_grace_child",
+            ])
             .env("CODEX_TEST_SHUTDOWN_GRACE_READY", &ready)
             .envs(exits.then_some(("CODEX_TEST_SHUTDOWN_GRACE_EXIT", "1")))
             .stdout(Stdio::null())
@@ -448,13 +497,30 @@ async fn shutdown_grace_handles_process_exit() {
             .record_is_active(&record)
             .await
             .expect("child status");
+        let outcome = result.expect("stop deadline");
+        #[cfg(unix)]
+        if !exits {
+            let error = outcome.unwrap_err();
+            assert!(error.to_string().contains("automatic force termination"));
+            assert!(still_running, "{name}");
+            assert_eq!(
+                backend.read_pid_file_state().await.unwrap(),
+                PidFileState::Running(record)
+            );
+        } else {
+            outcome.expect("safe graceful exit");
+            assert!(!still_running, "{name}");
+        }
+        #[cfg(windows)]
+        {
+            outcome.expect("updater outcome unchanged");
+            assert!(!still_running, "{name}");
+        }
         if still_running {
-            child.kill().expect("clean up daemon shim");
+            child.kill().expect("clean up owned synthetic shim");
         }
         let _ = child.wait(); // The backend may already have reaped a Unix child.
-        result.expect("stop deadline").expect("stop outcome");
         assert_eq!(ready.with_extension("exited").exists(), exits);
-        assert!(!still_running, "{name}");
     }
 }
 

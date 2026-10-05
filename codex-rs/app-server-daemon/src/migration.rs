@@ -132,7 +132,7 @@ pub(super) async fn run(http: &impl InstallerHttp, legacy: &Daemon) -> Result<Up
             "daemon selection changed; retry the update"
         );
         if let Some(running) = &running {
-            crate::thread_recovery::discard_pending(legacy)?;
+            crate::thread_recovery::require_clear(legacy)?;
             running
                 .stop_with_grace(settings.shutdown_grace_seconds)
                 .await?;
