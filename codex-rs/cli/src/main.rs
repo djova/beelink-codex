@@ -583,6 +583,10 @@ struct AppServerCommand {
     #[arg(long, hide = true)]
     managed_daemon: bool,
 
+    /// Required by the managed launcher; this package enforces the common interlock.
+    #[arg(long, hide = true, requires = "managed_daemon")]
+    require_recovery_interlock_v1: bool,
+
     /// Controls whether analytics are enabled by default.
     ///
     /// Analytics are disabled by default for app-server. Users have to explicitly opt in
@@ -1225,6 +1229,7 @@ async fn cli_main(
                 stdio,
                 remote_control,
                 managed_daemon,
+                require_recovery_interlock_v1: _,
                 analytics_default_enabled,
                 auth,
             } = app_server_cli;
@@ -3325,6 +3330,25 @@ mod tests {
             unreachable!()
         };
         app_server
+    }
+
+    #[test]
+    fn restart_interlock_capability_requires_managed_daemon() {
+        let command = app_server_from_args(&[
+            "codex",
+            "app-server",
+            "--managed-daemon",
+            "--require-recovery-interlock-v1",
+        ]);
+        assert!(command.managed_daemon && command.require_recovery_interlock_v1);
+        assert!(
+            MultitoolCli::try_parse_from([
+                "codex",
+                "app-server",
+                "--require-recovery-interlock-v1",
+            ])
+            .is_err()
+        );
     }
 
     fn default_app_server_socket_path() -> AbsolutePathBuf {

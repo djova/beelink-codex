@@ -1,14 +1,12 @@
-//! Saves persistent root thread IDs and restores them through the shared internal resume path.
-//! Recovery uses normal cold-resume semantics without delaying readiness for runtime loading.
-//! Already-loaded runtimes remain owned by their current clients.
-
-use std::io;
-use std::path::PathBuf;
+//! Durable inspected interruption reservations, never executable recovery claims.
 
 use codex_app_server_transport::daemon_recovery;
+use codex_app_server_transport::recovery_interlock::RecoveryStartupLease;
+use std::io;
+use std::sync::Arc;
 
 pub(crate) async fn snapshot(
-    path: PathBuf,
+    owner: Arc<RecoveryStartupLease>,
     saved: daemon_recovery::RecoverySnapshot,
 ) -> io::Result<()> {
     // A forced exit must not wait for file I/O in Tokio's blocking pool.
@@ -16,35 +14,23 @@ pub(crate) async fn snapshot(
     std::thread::Builder::new()
         .name("daemon-snapshot".into())
         .spawn(move || {
-            let result = daemon_recovery::write_snapshot(&path, &saved);
-            if result.is_err()
-                && let Err(err) = std::fs::remove_file(&path)
-                && err.kind() != io::ErrorKind::NotFound
-            {
-                tracing::warn!("failed to clear stale daemon recovery file: {err}");
-            }
+            let result = owner
+                .reserve_interruption(uuid::Uuid::now_v7(), &saved)
+                .map(|_| ());
             let _ = result_tx.send(result);
         })?;
     result_rx.await.map_err(io::Error::other)?
 }
 
-/// Consume the handoff before serving requests, then restore runtimes in the background.
-pub(crate) async fn start_recovery(
-    path: PathBuf,
-    processor: std::sync::Arc<crate::message_processor::MessageProcessor>,
-) -> io::Result<tokio::task::JoinHandle<()>> {
-    let candidates = tokio::task::spawn_blocking(move || {
-        let candidates = daemon_recovery::read_snapshot(&path);
-        // Even malformed or temporarily unreadable snapshots belong to this generation only.
-        match std::fs::remove_file(&path) {
-            Ok(()) => candidates,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => candidates,
-            Err(err) => Err(err),
-        }
-    })
-    .await
-    .map_err(io::Error::other)??;
-    Ok(tokio::spawn(async move {
-        processor.restore_daemon_threads(candidates).await;
-    }))
+/// Channel/router exits must meet the same durable boundary as requested exits.
+/// Retain the process owner on failure; no deletion, acknowledgement or replay.
+pub(crate) async fn guard_internal_exit(durable: bool) {
+    if !durable {
+        tracing::error!("managed exit held: interruption reservation is not durable");
+        std::future::pending::<()>().await;
+    }
 }
+
+#[cfg(all(test, unix))]
+#[path = "daemon_thread_recovery_tests.rs"]
+mod tests;

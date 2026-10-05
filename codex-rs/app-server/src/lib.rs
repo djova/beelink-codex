@@ -518,6 +518,21 @@ pub async fn run_main_with_transport_options(
         )
     })?;
     let codex_home = find_codex_home()?;
+    let recovery_file = daemon_recovery_file_path(&codex_home);
+    codex_app_server_transport::recovery_interlock::require_no_pending(&recovery_file)?;
+    let recovery_owner = if matches!(&transport, AppServerTransport::UnixSocket { .. }) {
+        let owner = Arc::new(
+            codex_app_server_transport::recovery_interlock::RecoveryStartupLease::acquire(
+                &recovery_file,
+            )?,
+        );
+        // Returning an async server entrypoint does not prove detached writers
+        // have stopped. Keep this lease until process exit, not merely task exit.
+        std::mem::forget(Arc::clone(&owner));
+        Some(owner)
+    } else {
+        None
+    };
     let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
@@ -956,7 +971,6 @@ pub async fn run_main_with_transport_options(
         info!("outbound router task exited (channel closed)");
     });
 
-    let recovery_file = daemon_recovery_file_path(&config.codex_home);
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
         let initialize_notification_sender = outgoing_message_sender.clone();
@@ -997,37 +1011,25 @@ pub async fn run_main_with_transport_options(
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
-            let recovery_task = if managed_daemon {
-                match daemon_thread_recovery::start_recovery(
-                    recovery_file.clone(),
-                    Arc::clone(&processor),
-                )
-                .await
-                {
-                    Ok(task) => Some(task),
-                    Err(err) => {
-                        warn!("failed to consume daemon recovery snapshot: {err}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
             let mut listen_for_threads = true;
             // Keep force signals and daemon control events responsive while saving.
             let mut snapshot = Box::pin(async {
                 let processor = Arc::clone(&processor);
-                let recovery_file = recovery_file.clone();
+                let recovery_owner = recovery_owner.clone();
                 // Run independently: snapshot locks can require the event loop to make progress.
                 let task = tokio::spawn(async move {
                     let saved = processor.daemon_recovery_snapshot().await;
-                    if let Err(err) = daemon_thread_recovery::snapshot(recovery_file, saved).await {
-                        warn!("failed to save threads during daemon shutdown: {err}");
-                    }
+                    let owner = recovery_owner
+                        .ok_or_else(|| std::io::Error::other("recovery owner unavailable"))?;
+                    daemon_thread_recovery::snapshot(owner, saved).await
                 });
-                let _ = tokio_util::task::AbortOnDropHandle::new(task).await;
+                matches!(
+                    tokio_util::task::AbortOnDropHandle::new(task).await,
+                    Ok(Ok(()))
+                )
             });
             let mut snapshot_finished = !managed_daemon;
+            let mut snapshot_attempted = !managed_daemon;
             let mut clients_disconnected = false;
             let mut shutdown_state = ShutdownState::default();
             let mut shutdown_signal_future = Box::pin(shutdown_signal());
@@ -1041,17 +1043,14 @@ pub async fn run_main_with_transport_options(
                     ShutdownAction::Finish
                 );
                 if ready_to_exit {
-                    if let Some(task) = &recovery_task {
-                        task.abort();
-                    }
-                    let finished = snapshot_finished || shutdown_state.forced();
+                    let finished = snapshot_finished;
                     if finished {
                         transport_shutdown_token.cancel();
                     }
-                    if managed_daemon && shutdown_state.forced() {
+                    if managed_daemon && shutdown_state.forced() && finished {
                         break "forced_shutdown_requested";
                     }
-                    if !clients_disconnected {
+                    if finished && !clients_disconnected {
                         let _ = outbound_control_tx
                             .send(OutboundControlEvent::DisconnectAll)
                             .await;
@@ -1063,8 +1062,12 @@ pub async fn run_main_with_transport_options(
                 }
 
                 tokio::select! {
-                    _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
-                        snapshot_finished = true;
+                    saved = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_attempted => {
+                        snapshot_attempted = true;
+                        snapshot_finished = saved;
+                        if !saved {
+                            warn!("managed shutdown held: interruption reservation is not durable");
+                        }
                     }
                     shutdown_signal_result = &mut shutdown_signal_future, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         shutdown_signal_future.set(shutdown_signal());
@@ -1306,8 +1309,19 @@ pub async fn run_main_with_transport_options(
                 }
             };
 
-            if let Some(task) = recovery_task {
-                task.abort();
+            // Every internal exit must reserve before closing connections or
+            // dropping thread tasks, including transport/router failure exits.
+            if managed_daemon {
+                processor.turn_admission.begin_drain();
+                while *active_admissions_rx.borrow_and_update() != 0 {
+                    if active_admissions_rx.changed().await.is_err() {
+                        daemon_thread_recovery::guard_internal_exit(/*durable*/ false).await;
+                    }
+                }
+                if !snapshot_attempted {
+                    snapshot_finished = (&mut snapshot).await;
+                }
+                daemon_thread_recovery::guard_internal_exit(snapshot_finished).await;
             }
             drop(snapshot);
             drop(thread_listener_tasks);
@@ -1340,8 +1354,12 @@ pub async fn run_main_with_transport_options(
 
     drop(transport_event_tx);
 
-    if matches!(processor_handle.await, Ok(AppServerExit::Forced)) {
-        return Ok(AppServerExit::Forced);
+    match processor_handle.await {
+        Ok(AppServerExit::Forced) => return Ok(AppServerExit::Forced),
+        Err(_) if managed_daemon => {
+            daemon_thread_recovery::guard_internal_exit(/*durable*/ false).await;
+        }
+        _ => {}
     }
     let _ = outbound_handle.await;
 
