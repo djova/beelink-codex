@@ -538,6 +538,7 @@ impl CodexThread {
             .submit_with_id(Submission {
                 id: new_submission_id(),
                 recovery_stamp: None,
+                admission_receipt: None,
                 op: Op::SuspendTurnAndShutdown { target, reply },
                 trace: current_span_w3c_trace_context(),
                 parent_turn_id: None,

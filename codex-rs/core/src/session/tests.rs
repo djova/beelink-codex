@@ -5881,6 +5881,7 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
         .send(Submission {
             id: "settings".into(),
             recovery_stamp: None,
+            admission_receipt: None,
             op: Op::ThreadSettings {
                 thread_settings: codex_protocol::protocol::ThreadSettingsOverrides::default(),
                 reply: Some(reply),
@@ -7942,6 +7943,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
         submission_dispatch_span(&Submission {
             id: "sub-1".into(),
             recovery_stamp: None,
+            admission_receipt: None,
             op: Op::Interrupt,
             parent_turn_id: None,
             root_turn_id: None,
@@ -7964,6 +7966,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
     let dispatch_span = submission_dispatch_span(&Submission {
         id: "sub-1".into(),
         recovery_stamp: None,
+        admission_receipt: None,
         op: Op::RealtimeConversationAudio(ConversationAudioParams {
             frame: RealtimeAudioFrame {
                 data: "ZmFrZQ==".into(),
@@ -8331,6 +8334,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
     let dispatch_span = submission_dispatch_span(&Submission {
         id: "sub-1".into(),
         recovery_stamp: None,
+        admission_receipt: None,
         op: Op::Interrupt,
         parent_turn_id: None,
         root_turn_id: None,

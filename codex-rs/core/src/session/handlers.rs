@@ -424,7 +424,10 @@ pub(super) async fn submission_loop(
 ) {
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
-    while let Ok(sub) = rx_sub.recv().await {
+    while let Ok(mut sub) = rx_sub.recv().await {
+        // Dispatch remains actor-serial. Receipt retirement does not mean the
+        // mutation succeeded; it only means this actor now owns its execution.
+        drop(sub.admission_receipt.take());
         if matches!(sub.op, Op::ResolveElicitation { .. }) {
             debug!(submission_id = %sub.id, operation = sub.op.kind(), "Submission");
         } else {

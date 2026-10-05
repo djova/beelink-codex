@@ -32,6 +32,7 @@ fn continuation(id: &str) -> Submission {
     Submission {
         id: id.into(),
         recovery_stamp: None,
+        admission_receipt: None,
         op: Op::TurnInput {
             request: Box::new(TurnInputRequest::user_input(Vec::new())),
             mode: TurnInputMode::ContinueIfIdle {
@@ -89,6 +90,7 @@ async fn recovery_admission_cancelled_backpressured_send_still_invalidates() {
     );
     let candidate = rx.recv().await.unwrap();
     assert_eq!(io.recovery_admission.state.lock().await.generation, 1);
+    assert_eq!(io.recovery_admission.pending.load(Ordering::SeqCst), 0);
     assert!(
         io.recovery_admission
             .seal(&candidate.id, candidate.recovery_stamp.as_ref())
@@ -260,4 +262,128 @@ async fn recovery_admission_actual_actor_rejects_later_accepted_cancellation_bef
     );
     io.submit(Op::Shutdown).await.unwrap();
     actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_admission_earlier_delayed_acceptance_blocks_actual_actor_seal() {
+    let (session, _, _) = make_session_and_context_with_rx().await;
+    session.state.lock().await.last_started_turn_id = Some("failed".into());
+    let before = session.thread_settings_snapshot().await;
+    let admission = Arc::clone(&session.recovery_admission);
+    let (source, source_rx) = endpoint(Arc::clone(&admission), 2);
+    let (destination, destination_rx) = endpoint(Arc::clone(&admission), 2);
+    source.submit(Op::Interrupt).await.unwrap();
+    let delayed = source_rx.recv().await.unwrap();
+    let (reply, result) = oneshot::channel();
+    let mut automatic = continuation("stable-op");
+    if let Op::TurnInput { reply: target, .. } = &mut automatic.op {
+        *target = reply;
+    }
+    source.submit_with_id(automatic).await.unwrap();
+    destination
+        .submit_with_id(source_rx.recv().await.unwrap())
+        .await
+        .unwrap();
+    // Both generations match; only the earlier live receipt prevents admission.
+    assert_eq!(admission.state.lock().await.generation, 1);
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 1);
+    let actor = tokio::spawn(submission_loop(
+        Arc::clone(&session),
+        session.get_config().await,
+        destination_rx,
+    ));
+    assert_eq!(
+        result.await.unwrap().unwrap(),
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded,
+        }
+    );
+    assert_eq!(session.thread_settings_snapshot().await, before);
+    assert!(session.active_turn.lock().await.is_none());
+    drop(delayed);
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 0);
+    destination.submit(Op::Shutdown).await.unwrap();
+    actor.await.unwrap();
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn recovery_admission_forwarding_moves_one_receipt_until_dispatched_or_dropped() {
+    let admission = Arc::new(RecoveryAdmission::default());
+    let (source, source_rx) = endpoint(Arc::clone(&admission), 1);
+    let (destination, destination_rx) = endpoint(Arc::clone(&admission), 1);
+    source.submit(Op::Interrupt).await.unwrap();
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 1);
+    destination
+        .submit_with_id(source_rx.recv().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 1);
+    let mut dispatched = destination_rx.recv().await.unwrap();
+    drop(dispatched.admission_receipt.take());
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 0);
+    drop(dispatched);
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 0);
+    destination_rx.close();
+    assert!(destination.submit(Op::Interrupt).await.is_err());
+    assert_eq!(admission.pending.load(Ordering::SeqCst), 0);
+    assert_eq!(admission.state.lock().await.generation, 2);
+}
+
+#[tokio::test]
+async fn recovery_admission_foreign_receipt_recounts_and_pending_overflow_holds() {
+    let (source, source_rx) = endpoint(Arc::new(Default::default()), 1);
+    let (destination, destination_rx) = endpoint(Arc::new(Default::default()), 1);
+    source.submit(Op::Interrupt).await.unwrap();
+    destination
+        .submit_with_id(source_rx.recv().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(source.recovery_admission.pending.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        destination
+            .recovery_admission
+            .pending
+            .load(Ordering::SeqCst),
+        1
+    );
+    drop(destination_rx.recv().await.unwrap());
+    assert_eq!(
+        destination
+            .recovery_admission
+            .pending
+            .load(Ordering::SeqCst),
+        0
+    );
+    destination
+        .recovery_admission
+        .pending
+        .store(u64::MAX, Ordering::SeqCst);
+    destination.submit(Op::Interrupt).await.unwrap();
+    assert!(destination.recovery_admission.state.lock().await.exhausted);
+    assert!(
+        destination_rx
+            .recv()
+            .await
+            .unwrap()
+            .admission_receipt
+            .is_none()
+    );
+    let mut candidate = continuation("stable-op");
+    destination
+        .recovery_admission
+        .accept(
+            &candidate.id,
+            &candidate.op,
+            &mut candidate.recovery_stamp,
+            &mut candidate.admission_receipt,
+        )
+        .await;
+    assert!(
+        destination
+            .recovery_admission
+            .seal(&candidate.id, candidate.recovery_stamp.as_ref())
+            .await
+            .is_none()
+    );
 }

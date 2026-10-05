@@ -10,6 +10,8 @@ pub(crate) struct Submission {
     pub id: String,
     /// Local acceptance stamp; never an interruption-ownership proof.
     pub recovery_stamp: Option<super::recovery_admission::RecoveryStamp>,
+    /// Retired on real actor dispatch or dropped submission; never replay authority.
+    pub admission_receipt: Option<super::recovery_admission::AcceptanceReceipt>,
     pub op: Op,
     /// Optional W3C trace carrier propagated across async submission handoffs.
     pub trace: Option<W3cTraceContext>,

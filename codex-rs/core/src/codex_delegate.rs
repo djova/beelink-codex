@@ -261,6 +261,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                     .submit_with_id(Submission {
                         id: "shutdown".to_string(),
                         recovery_stamp: None,
+                        admission_receipt: None,
                         op: Op::Shutdown {},
                         trace: None,
                         parent_turn_id: None,

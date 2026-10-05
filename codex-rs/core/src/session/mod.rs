@@ -969,6 +969,7 @@ impl SessionIo {
         let sub = Submission {
             id: id.clone(),
             recovery_stamp: None,
+            admission_receipt: None,
             op,
             trace,
             parent_turn_id,
@@ -985,7 +986,12 @@ impl SessionIo {
             sub.trace = current_span_w3c_trace_context();
         }
         self.recovery_admission
-            .accept(&sub.id, &sub.op, &mut sub.recovery_stamp)
+            .accept(
+                &sub.id,
+                &sub.op,
+                &mut sub.recovery_stamp,
+                &mut sub.admission_receipt,
+            )
             .await;
         self.tx_sub
             .send(sub)
@@ -1009,6 +1015,7 @@ impl SessionIo {
         self.submit_with_id(Submission {
             id,
             recovery_stamp: None,
+            admission_receipt: None,
             op: Op::TurnInput {
                 request: Box::new(request),
                 mode,
@@ -1034,6 +1041,7 @@ impl SessionIo {
         self.submit_with_id(Submission {
             id: turn_id,
             recovery_stamp: None,
+            admission_receipt: None,
             op: Op::RecoverTurn {
                 thread_settings,
                 start_options,

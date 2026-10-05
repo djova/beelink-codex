@@ -149,6 +149,7 @@ async fn forward_ops_preserves_submission_trace_context() {
     let submission = Submission {
         id: "sub-1".to_string(),
         recovery_stamp: None,
+        admission_receipt: None,
         op: Op::Interrupt,
         trace: Some(codex_protocol::protocol::W3cTraceContext {
             traceparent: Some(
