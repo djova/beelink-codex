@@ -8,6 +8,8 @@ use tokio::sync::OwnedRwLockReadGuard;
 #[expect(dead_code, reason = "Turn ancestry is retained in Debug diagnostics.")]
 pub(crate) struct Submission {
     pub id: String,
+    /// Local acceptance stamp; never an interruption-ownership proof.
+    pub recovery_stamp: Option<super::recovery_admission::RecoveryStamp>,
     pub op: Op,
     /// Optional W3C trace carrier propagated across async submission handoffs.
     pub trace: Option<W3cTraceContext>,

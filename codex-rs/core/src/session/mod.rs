@@ -237,6 +237,7 @@ mod guardian_checkpoint;
 mod handlers;
 mod inject;
 mod reasoning_effort;
+pub(crate) mod recovery_admission;
 mod submission;
 pub(crate) use reasoning_effort::RequestEffortUsage;
 pub(crate) use submission::Submission;
@@ -403,6 +404,7 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 #[derive(Clone)]
 pub(crate) struct SessionIo {
     pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) recovery_admission: Arc<recovery_admission::RecoveryAdmission>,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
@@ -931,6 +933,7 @@ impl Session {
                 .await;
         });
         let io = SessionIo {
+            recovery_admission: Arc::clone(&session.recovery_admission),
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
@@ -965,6 +968,7 @@ impl SessionIo {
         let id = new_submission_id();
         let sub = Submission {
             id: id.clone(),
+            recovery_stamp: None,
             op,
             trace,
             parent_turn_id,
@@ -980,6 +984,9 @@ impl SessionIo {
         if sub.trace.is_none() {
             sub.trace = current_span_w3c_trace_context();
         }
+        self.recovery_admission
+            .accept(&sub.id, &sub.op, &mut sub.recovery_stamp)
+            .await;
         self.tx_sub
             .send(sub)
             .await
@@ -1001,6 +1008,7 @@ impl SessionIo {
         let trace = request.trace.take();
         self.submit_with_id(Submission {
             id,
+            recovery_stamp: None,
             op: Op::TurnInput {
                 request: Box::new(request),
                 mode,
@@ -1025,6 +1033,7 @@ impl SessionIo {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.submit_with_id(Submission {
             id: turn_id,
+            recovery_stamp: None,
             op: Op::RecoverTurn {
                 thread_settings,
                 start_options,

@@ -40,6 +40,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
     let io = Arc::new(SessionIo {
         tx_sub,
+        recovery_admission: Arc::new(Default::default()),
         rx_event: rx_events,
         agent_status,
         session_loop_termination: completed_session_loop_termination(),
@@ -136,6 +137,7 @@ async fn forward_ops_preserves_submission_trace_context() {
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
     let io = Arc::new(SessionIo {
         tx_sub,
+        recovery_admission: Arc::new(Default::default()),
         rx_event: rx_events,
         agent_status,
         session_loop_termination: completed_session_loop_termination(),
@@ -146,6 +148,7 @@ async fn forward_ops_preserves_submission_trace_context() {
 
     let submission = Submission {
         id: "sub-1".to_string(),
+        recovery_stamp: None,
         op: Op::Interrupt,
         trace: Some(codex_protocol::protocol::W3cTraceContext {
             traceparent: Some(

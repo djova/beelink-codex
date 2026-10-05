@@ -5880,6 +5880,7 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
     tx_sub
         .send(Submission {
             id: "settings".into(),
+            recovery_stamp: None,
             op: Op::ThreadSettings {
                 thread_settings: codex_protocol::protocol::ThreadSettingsOverrides::default(),
                 reply: Some(reply),
@@ -6709,6 +6710,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
 
     let session = Session {
         thread_id,
+        recovery_admission: Arc::new(Default::default()),
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         agent_status: agent_status_tx,
@@ -7843,6 +7845,7 @@ async fn submit_with_trace_captures_current_span_trace_context() {
     let (_tx_event, rx_event) = async_channel::unbounded();
     let io = SessionIo {
         tx_sub,
+        recovery_admission: Arc::new(Default::default()),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: completed_session_loop_termination(),
@@ -7938,6 +7941,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
     let dispatch_span = ambient_span.in_scope(|| {
         submission_dispatch_span(&Submission {
             id: "sub-1".into(),
+            recovery_stamp: None,
             op: Op::Interrupt,
             parent_turn_id: None,
             root_turn_id: None,
@@ -7959,6 +7963,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
 
     let dispatch_span = submission_dispatch_span(&Submission {
         id: "sub-1".into(),
+        recovery_stamp: None,
         op: Op::RealtimeConversationAudio(ConversationAudioParams {
             frame: RealtimeAudioFrame {
                 data: "ZmFrZQ==".into(),
@@ -8325,6 +8330,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
 
     let dispatch_span = submission_dispatch_span(&Submission {
         id: "sub-1".into(),
+        recovery_stamp: None,
         op: Op::Interrupt,
         parent_turn_id: None,
         root_turn_id: None,
@@ -8671,6 +8677,7 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
     });
     let io = Arc::new(SessionIo {
         tx_sub,
+        recovery_admission: Arc::new(Default::default()),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
@@ -8707,6 +8714,7 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
     });
     let io = Arc::new(SessionIo {
         tx_sub,
+        recovery_admission: Arc::new(Default::default()),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
@@ -8985,6 +8993,7 @@ where
 
     let session = Arc::new(Session {
         thread_id,
+        recovery_admission: Arc::new(Default::default()),
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         agent_status: agent_status_tx,

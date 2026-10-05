@@ -150,6 +150,7 @@ async fn test_review_session() -> (
             session,
             io: SessionIo {
                 tx_sub,
+                recovery_admission: Arc::new(Default::default()),
                 rx_event,
                 agent_status,
                 session_loop_termination: crate::session::completed_session_loop_termination(),

@@ -489,6 +489,7 @@ fn settings_submission(
     (
         Submission {
             id: id.to_string(),
+            recovery_stamp: None,
             op: Op::TurnSettings {
                 turn_id: turn_id.to_string(),
                 update,

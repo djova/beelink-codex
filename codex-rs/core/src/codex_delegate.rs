@@ -165,6 +165,7 @@ pub(crate) fn forward_session_io(io: Arc<SessionIo>, cancel_token: CancellationT
     // Forward public events from the sub-agent to the consumer.
     let caller_io = SessionIo {
         tx_sub: tx_ops,
+        recovery_admission: Arc::clone(&io.recovery_admission),
         rx_event: rx_sub,
         agent_status: io.agent_status.clone(),
         session_loop_termination: io.session_loop_termination.clone(),
@@ -244,7 +245,7 @@ pub(crate) async fn run_codex_thread_one_shot(
 
     // Bridge events so we can observe completion and shut down automatically.
     let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let ops_tx = io.tx_sub.clone();
+    let recovery_admission = Arc::clone(&io.recovery_admission);
     let agent_status = io.agent_status.clone();
     let session_loop_termination = io.session_loop_termination.clone();
     let io_for_bridge = io;
@@ -256,9 +257,10 @@ pub(crate) async fn run_codex_thread_one_shot(
             );
             let _ = tx_bridge.send(event).await;
             if should_shutdown {
-                let _ = ops_tx
-                    .send(Submission {
+                let _ = io_for_bridge
+                    .submit_with_id(Submission {
                         id: "shutdown".to_string(),
+                        recovery_stamp: None,
                         op: Op::Shutdown {},
                         trace: None,
                         parent_turn_id: None,
@@ -283,6 +285,7 @@ pub(crate) async fn run_codex_thread_one_shot(
         SessionIo {
             rx_event: rx_bridge,
             tx_sub: tx_closed,
+            recovery_admission,
             agent_status,
             session_loop_termination,
         },
