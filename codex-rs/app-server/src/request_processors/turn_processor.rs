@@ -1081,6 +1081,11 @@ impl TurnRequestProcessor {
             SteerSubmission::Steered { turn_id } => turn_id,
             SteerSubmission::NotSubmitted { reason } => {
                 let (message, data, error_type) = match reason {
+                    NotSubmittedReason::RecoveryInventoryUnknown => (
+                        "recovery is held pending authoritative runtime inventory".to_string(),
+                        None,
+                        None,
+                    ),
                     NotSubmittedReason::ServerDraining => {
                         return Err(crate::error_code::server_draining_error());
                     }

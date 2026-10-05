@@ -27,6 +27,8 @@ pub enum SuspendTurnOutcome {
     /// A currently loaded descendant would remain running after root handoff.
     HasLiveDescendants,
     UnsupportedTask,
+    /// No authoritative seal covers queue, child, job, approval and tool outcomes.
+    RecoveryInventoryUnknown,
 }
 
 /// Which active root turn a suspension operation may stop.
@@ -230,6 +232,8 @@ pub enum SteerSubmission {
 /// Why Core did not accept submitted turn input for turn processing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotSubmittedReason {
+    /// Automatic recovery has no complete, sealed runtime outcome inventory.
+    RecoveryInventoryUnknown,
     /// New work superseded the expected previous turn of an internal continuation.
     Superseded,
 

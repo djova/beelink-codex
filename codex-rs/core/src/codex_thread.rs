@@ -436,9 +436,10 @@ impl CodexThread {
         }
     }
 
-    /// Starts a new internal continuation turn when idle, including in Plan mode.
-    /// Rejects if a newer task has started, even if it has already finished.
-    /// The input must be a response item; it is never treated as user authorization.
+    /// Requests an internal continuation when idle. Currently held until complete
+    /// runtime inventory, durable candidate fencing and operation reconciliation exist.
+    /// Newer tasks/settings or later locally accepted input supersede the request.
+    /// The response input is never treated as user authorization.
     pub async fn continue_turn_if_idle(
         &self,
         request: TurnInputRequest,
@@ -458,8 +459,8 @@ impl CodexThread {
     /// Recovery starts no new user input and preserves the turn ID that was
     /// already recorded for the interrupted turn.
     /// Rejects an ID superseded by a newer task or a standalone settings change
-    /// in this runtime. Settings-only invalidation is not yet durable on cold resume.
-    /// This does not itself prove interruption ownership or reconcile tool outcomes.
+    /// in this runtime or after durable cold settings invalidation. Currently held
+    /// until complete runtime inventory, ownership and outcome reconciliation exist.
     pub async fn recover_turn_if_idle(
         &self,
         request: RecoverTurnRequest,
@@ -500,27 +501,16 @@ impl CodexThread {
         }
     }
 
-    /// Stops the active unfinished root turn without recording TurnAborted or
-    /// TurnComplete, so another worker can recover its original turn ID.
-    ///
-    /// Suspension is refused while a currently loaded descendant exists. Past
-    /// descendants do not prevent recovery, and concurrent descendant admission
-    /// is not sealed. Queued user input and outstanding approval, elicitation,
-    /// or server-request waiters remain best effort and may be discarded.
-    ///
-    /// The session processes an accepted request even if its caller disconnects.
-    /// Callers must not transfer ownership until suspension succeeds, which
-    /// requires stopping execution, flushing history, and closing its writer.
+    /// Requests root-turn handoff. Currently held: authoritative queue, child,
+    /// approval, job and external-outcome seals and durable ownership are absent.
+    /// No input/waiter state is discarded and no running task is cancelled.
     pub async fn suspend_turn_and_shutdown(&self) -> CodexResult<SuspendTurnOutcome> {
         self.suspend_target_and_shutdown(codex_protocol::turn_input::SuspendTurnTarget::Current)
             .await
     }
 
-    /// Suspend only the inspected root turn, refusing a newer active turn.
-    ///
-    /// The comparison is made in the session actor and repeated under the active
-    /// turn removal lock after persistence yields. This does not seal child spawns,
-    /// guard queued input/settings changes, or prove durable interruption ownership.
+    /// Binds inspection to an exact root turn; current identities still return
+    /// inventory-unknown without stopping execution. Later local acceptance wins.
     pub async fn suspend_turn_and_shutdown_if_current(
         &self,
         turn_id: String,

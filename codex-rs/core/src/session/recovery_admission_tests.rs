@@ -1,9 +1,13 @@
 use super::*;
 use crate::session::SessionIo;
 use crate::session::completed_session_loop_termination;
+use crate::session::handlers::submission_loop;
 use crate::session::submission::Submission;
+use crate::session::tests::make_session_and_context_with_rx;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::turn_input::NotSubmittedReason;
 use codex_protocol::turn_input::TurnInputRequest;
+use codex_protocol::turn_input::TurnInputSubmission;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -177,4 +181,83 @@ async fn recovery_admission_new_runtime_rejects_retained_stamp_and_exhaustion_ho
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn recovery_admission_actual_actor_holds_duplicate_operations_without_settings_or_start() {
+    let (session, _, _) = make_session_and_context_with_rx().await;
+    session.state.lock().await.last_started_turn_id = Some("failed".into());
+    let before = session.thread_settings_snapshot().await;
+    let (io, rx) = endpoint(Arc::clone(&session.recovery_admission), 4);
+    let actor = tokio::spawn(submission_loop(
+        Arc::clone(&session),
+        session.get_config().await,
+        rx,
+    ));
+    for _ in 0..2 {
+        assert_eq!(
+            io.submit_recover_turn(
+                ThreadSettingsOverrides {
+                    model: Some("must-not-apply".into()),
+                    ..Default::default()
+                },
+                Default::default(),
+                None,
+                "failed".into(),
+            )
+            .await
+            .unwrap(),
+            TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::RecoveryInventoryUnknown
+            }
+        );
+    }
+    assert_eq!(
+        io.submit_recover_turn(
+            Default::default(),
+            Default::default(),
+            None,
+            "stale-turn".into()
+        )
+        .await
+        .unwrap(),
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded
+        }
+    );
+    assert_eq!(session.thread_settings_snapshot().await, before);
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session.state.lock().await.last_started_turn_id.as_deref(),
+        Some("failed")
+    );
+    io.submit(Op::Shutdown).await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_admission_actual_actor_rejects_later_accepted_cancellation_before_processing() {
+    let (session, _, _) = make_session_and_context_with_rx().await;
+    session.state.lock().await.last_started_turn_id = Some("failed".into());
+    let (io, rx) = endpoint(Arc::clone(&session.recovery_admission), 4);
+    let (reply, result) = oneshot::channel();
+    let mut candidate = continuation("stable-op");
+    if let Op::TurnInput { reply: target, .. } = &mut candidate.op {
+        *target = reply;
+    }
+    io.submit_with_id(candidate).await.unwrap();
+    io.submit(Op::Interrupt).await.unwrap();
+    let actor = tokio::spawn(submission_loop(
+        Arc::clone(&session),
+        session.get_config().await,
+        rx,
+    ));
+    assert_eq!(
+        result.await.unwrap().unwrap(),
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded
+        }
+    );
+    io.submit(Op::Shutdown).await.unwrap();
+    actor.await.unwrap();
 }

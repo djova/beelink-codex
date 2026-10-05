@@ -30,27 +30,61 @@ impl SessionTask for WaitingTask {
 }
 
 #[tokio::test]
-async fn suspension_after_flush_rejects_replacement_turn_without_taking_or_cancelling_it() {
+async fn recovery_admission_suspension_holds_unknown_and_preserves_exact_task() {
     let (session, mut context, _events) = make_session_and_context_with_rx().await;
     Arc::get_mut(&mut context).unwrap().sub_id = "new-manual-turn".into();
     session
         .spawn_task(Arc::clone(&context), Vec::new(), WaitingTask)
         .await;
-    // Model the exact lock boundary after the pre-suspension flush has yielded
-    // and a replacement task became active. The production removal uses this
-    // same function while holding the same active-turn lock.
-    {
-        let mut active = session.active_turn.lock().await;
-        let task = active.as_ref().unwrap().task.as_ref().unwrap();
-        let cancellation = task.cancellation_token.clone();
-        let task_context = Arc::clone(&task.turn_context);
-        assert_eq!(
-            take_inspected_turn(&mut active, "inspected-old-turn").err(),
-            Some(SuspendTurnOutcome::Superseded),
-        );
-        let preserved = active.as_ref().unwrap().task.as_ref().unwrap();
-        assert!(Arc::ptr_eq(&preserved.turn_context, &task_context));
-        assert!(!cancellation.is_cancelled());
-    }
+    let cancellation = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .task
+        .as_ref()
+        .unwrap()
+        .cancellation_token
+        .clone();
+    assert_eq!(
+        suspend_turn_and_shutdown(
+            &session,
+            "owned-op".into(),
+            SuspendTurnTarget::Expected {
+                turn_id: "inspected-old-turn".into()
+            }
+        )
+        .await
+        .unwrap(),
+        SuspendTurnOutcome::Superseded,
+    );
+    assert_eq!(
+        suspend_turn_and_shutdown(
+            &session,
+            "owned-op".into(),
+            SuspendTurnTarget::Expected {
+                turn_id: "new-manual-turn".into()
+            }
+        )
+        .await
+        .unwrap(),
+        SuspendTurnOutcome::RecoveryInventoryUnknown,
+    );
+    assert!(!cancellation.is_cancelled());
+    assert_eq!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .turn_context
+            .sub_id,
+        "new-manual-turn"
+    );
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

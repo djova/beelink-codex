@@ -395,6 +395,21 @@ async fn start_if_idle(
         ..
     } = request;
     let origin = UserInputOrigin::from_turn_trigger(start.turn_trigger.as_deref());
+    if kind == TurnStartKind::Recovery {
+        // Do not mutate settings or reserve a task before authoritative queue,
+        // approval, child/job and external-outcome admission exists. Empty
+        // connection-local pending lists are not a complete inventory.
+        let reason = if session.active_turn.lock().await.is_some() {
+            NotSubmittedReason::NotIdle
+        } else if expected_previous_turn_id.as_ref()
+            != session.state.lock().await.last_started_turn_id.as_ref()
+        {
+            NotSubmittedReason::Superseded
+        } else {
+            NotSubmittedReason::RecoveryInventoryUnknown
+        };
+        return Ok(TurnInputSubmission::NotSubmitted { reason });
+    }
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,

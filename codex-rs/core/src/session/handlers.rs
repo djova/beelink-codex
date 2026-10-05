@@ -431,6 +431,14 @@ pub(super) async fn submission_loop(
             debug!(?sub, "Submission");
         }
         let dispatch_span = submission_dispatch_span(&sub);
+        let is_recovery = super::recovery_admission::is_recovery(&sub.op);
+        let recovery_seal = if is_recovery {
+            sess.recovery_admission
+                .seal(&sub.id, sub.recovery_stamp.as_ref())
+                .await
+        } else {
+            None
+        };
         let should_exit = async {
             match sub.op {
                 Op::Interrupt => {
@@ -487,7 +495,15 @@ pub(super) async fn submission_loop(
                     mode,
                     reply,
                 } => {
-                    let result = turn_input::handle(&sess, *request, mode, sub.id.clone()).await;
+                    let result = if is_recovery && recovery_seal.is_none() {
+                        Ok(
+                            codex_protocol::turn_input::TurnInputSubmission::NotSubmitted {
+                                reason: codex_protocol::turn_input::NotSubmittedReason::Superseded,
+                            },
+                        )
+                    } else {
+                        turn_input::handle(&sess, *request, mode, sub.id.clone()).await
+                    };
                     let _ = reply.send(result);
                     false
                 }
@@ -496,23 +512,35 @@ pub(super) async fn submission_loop(
                     start_options,
                     reply,
                 } => {
-                    let result = turn_input::handle_recovery(
-                        &sess,
-                        thread_settings,
-                        start_options,
-                        sub.id.clone(),
-                    )
-                    .await;
+                    let result = if recovery_seal.is_none() {
+                        Ok(
+                            codex_protocol::turn_input::TurnInputSubmission::NotSubmitted {
+                                reason: codex_protocol::turn_input::NotSubmittedReason::Superseded,
+                            },
+                        )
+                    } else {
+                        turn_input::handle_recovery(
+                            &sess,
+                            thread_settings,
+                            start_options,
+                            sub.id.clone(),
+                        )
+                        .await
+                    };
                     let _ = reply.send(result);
                     false
                 }
                 Op::SuspendTurnAndShutdown { target, reply } => {
-                    let result = super::turn_suspension::suspend_turn_and_shutdown(
-                        &sess,
-                        sub.id.clone(),
-                        target,
-                    )
-                    .await;
+                    let result = if recovery_seal.is_none() {
+                        Ok(codex_protocol::turn_input::SuspendTurnOutcome::Superseded)
+                    } else {
+                        super::turn_suspension::suspend_turn_and_shutdown(
+                            &sess,
+                            sub.id.clone(),
+                            target,
+                        )
+                        .await
+                    };
                     // Exit only after history is durable and its writer has closed; an error
                     // must leave responsibility for the thread with the current worker.
                     let should_exit = matches!(

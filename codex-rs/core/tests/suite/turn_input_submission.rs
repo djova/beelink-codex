@@ -47,6 +47,99 @@ use tokio::sync::Barrier;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+#[tokio::test]
+async fn recovery_admission_public_thread_holds_without_replaying_or_changing_settings() {
+    let server = responses::start_mock_server().await;
+    let test = test_codex().build_with_auto_env(&server).await.unwrap();
+    responses::mount_sse_once(&server, responses::sse_completed("original")).await;
+    let TurnInputSubmission::Started { turn_id } = test
+        .codex
+        .start_or_steer_turn(user_message_request("one original action"))
+        .await
+        .unwrap()
+    else {
+        panic!("original turn did not start")
+    };
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let before = test.codex.thread_settings_snapshot().await;
+    for _ in 0..2 {
+        assert_eq!(
+            test.codex
+                .recover_turn_if_idle(RecoverTurnRequest {
+                    turn_id: turn_id.clone(),
+                    thread_settings: ThreadSettingsOverrides {
+                        model: Some("must-not-apply".into()),
+                        ..Default::default()
+                    },
+                    trace: None,
+                    cyber_access_program: None,
+                })
+                .await
+                .unwrap(),
+            StartIfIdleSubmission::NotSubmitted {
+                reason: NotSubmittedReason::RecoveryInventoryUnknown
+            }
+        );
+    }
+    let input = ContextualUserFragment::into(InternalModelContextFragment::new(
+        InternalContextSource::from_static("daemon_recovery"),
+        "Continue only if owned.",
+    ));
+    assert_eq!(
+        test.codex
+            .continue_turn_if_idle(
+                TurnInputRequest::new(TurnInput::ResponseItem(input)),
+                turn_id.clone()
+            )
+            .await
+            .unwrap(),
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::RecoveryInventoryUnknown
+        }
+    );
+    assert_eq!(test.codex.thread_settings_snapshot().await, before);
+    let different_effort =
+        if before.reasoning_effort == Some(codex_protocol::openai_models::ReasoningEffort::High) {
+            codex_protocol::openai_models::ReasoningEffort::Medium
+        } else {
+            codex_protocol::openai_models::ReasoningEffort::High
+        };
+    assert_ne!(before.reasoning_effort, Some(different_effort.clone()));
+    for effort in [Some(different_effort), before.reasoning_effort.clone()] {
+        submit_thread_settings(
+            &test.codex,
+            ThreadSettingsOverrides {
+                effort: Some(effort),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(test.codex.thread_settings_snapshot().await, before);
+    assert_eq!(
+        test.codex
+            .recover_turn_if_idle(RecoverTurnRequest {
+                turn_id,
+                thread_settings: Default::default(),
+                trace: None,
+                cyber_access_program: None,
+            })
+            .await
+            .unwrap(),
+        StartIfIdleSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded,
+        }
+    );
+    assert_eq!(
+        responses::received_responses_requests(&server).await.len(),
+        1
+    );
+}
+
 #[derive(Debug)]
 struct TestAdmission(AtomicBool);
 
